@@ -1,3 +1,4 @@
+#define SURVIVEX_TEST_FAULTS
 #include "../wokwi.ino"
 #include <iostream>
 
@@ -42,6 +43,14 @@ int main() {
   while (std::getline(std::cin,line)) {
     if (line.rfind("LABEL:",0)==0) {
       assert(std::find(tft.labels.begin(),tft.labels.end(),line.substr(6))!=tft.labels.end());
+      continue;
+    }
+    if (line=="FAILPAINT") { paintFaultCountdown=0; continue; }
+    if (line=="FAILAFTER") { paintFaultCountdown=1; continue; }
+    if (line=="CHECKRESYNC") {
+      assert(linkLost && Serial.log.find("resync")!=std::string::npos);
+      assert(Serial.log.rfind("resync")>Serial.log.rfind("ack"));
+      paintFaultCountdown=-1;
       continue;
     }
     if (line=="EXTINPUT") {

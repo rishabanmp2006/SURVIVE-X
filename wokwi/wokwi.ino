@@ -92,7 +92,13 @@ void fillPolygon(JsonArrayConst op) {
   }
 }
 
+#ifdef SURVIVEX_TEST_FAULTS
+int paintFaultCountdown = -1;
+#endif
 bool primitive(const char *line, bool paint) {
+#ifdef SURVIVEX_TEST_FAULTS
+  if (paint && paintFaultCountdown >= 0 && paintFaultCountdown-- == 0) return false;
+#endif
   JsonDocument doc;
   if (deserializeJson(doc,line)) return false;
   JsonArrayConst op=doc.as<JsonArrayConst>();
@@ -172,6 +178,20 @@ bool commit(uint32_t wanted) {
   }
   if (~crc!=wanted) return false;
   if (frameDelta && (linkLost || frameBase!=lastFrame || strcmp(frameScreen,cachedScreen))) return false;
+  // Paint from the validated pending operations. Commit the baseline only after
+  // every detectable parse/draw operation succeeds.
+  if (!menu && destinationPinned && !extended && frameDestination!=placeIds[place]) {
+    unavailable("WAITING FOR SELECTED DESTINATION");
+  } else if (!menu) {
+    if (!frameDelta) tft.fillScreen(0);
+    for (unsigned i=0; i<received; ++i) {
+      if (!primitive(pending[i],true)) {
+        unavailable("DRAW FAILURE");
+        return false;
+      }
+      if (incremental) pollInput(millis());
+    }
+  }
   if (!frameDelta) {
     memcpy(cached,pending,received*sizeof(cached[0]));
     cachedCount=received;
@@ -179,11 +199,6 @@ bool commit(uint32_t wanted) {
   cachedDestination=frameDestination;
   strcpy(cachedScreen,frameScreen);
   expected=0; linkLost=false; lastGood=millis(); lastFrame=frameId;
-  if (!menu) {
-    if (frameDelta) {
-      for (unsigned i=0; i<received; ++i) { primitive(pending[i],true); pollInput(millis()); }
-    } else renderCurrent();
-  }
   emitEvent("ack","session",session);
   return true;
 }
@@ -210,7 +225,14 @@ void renderCurrent() {
       unavailable("WAITING FOR SELECTED DESTINATION"); return;
     }
     tft.fillScreen(0);
-    for (unsigned i=0; i<cachedCount; ++i) { primitive(cached[i],true); if (incremental) pollInput(millis()); }
+    for (unsigned i=0; i<cachedCount; ++i) {
+      if (!primitive(cached[i],true)) {
+        unavailable("DRAW FAILURE");
+        invalidate("DRAW FAILURE");
+        return;
+      }
+      if (incremental) pollInput(millis());
+    }
     // The host owns all pixels of an external frame.
     return;
   }

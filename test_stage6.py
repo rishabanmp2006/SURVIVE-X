@@ -103,6 +103,8 @@ class HardwareTests(unittest.TestCase):
             ui.live_declination=5
             self.assertEqual(ui.navigation_state().true_heading,95)
             sensors.feed_nmea(line[:-4]+b'00\r\n')
+            self.assertFalse(ui.navigation_state().has_position)
+            sensors.feed_nmea(sentence('GPGGA,123520,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,'))
             self.assertTrue(ui.navigation_state().has_position)
             now[0]+=6
             with patch('navigation.time.time',return_value=now[0]):
@@ -112,7 +114,7 @@ class HardwareTests(unittest.TestCase):
                 self.assertFalse(ui.navigation_state().has_position)
             sensors.feed_nmea(sentence('GPGGA,123520,,,,,0,00,,,,,,,'))
             self.assertFalse(sensors.gps().has_fix)
-            sensors.feed_nmea(line)
+            sensors.feed_nmea(sentence('GPGGA,123521,4807.038,N,01131.000,E,1,08,0.9,545.4,M,46.9,M,,'))
             self.assertTrue(sensors.gps().has_fix)
             sensors.disconnect_gnss(); sensors.disconnect_compass()
             self.assertFalse(sensors.gps().has_fix);self.assertIsNone(sensors.compass())

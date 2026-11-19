@@ -106,6 +106,8 @@ with tempfile.TemporaryDirectory() as tmp:
     out=run([hello]+full[:10]+['EXTINPUT']+full[10:]+delta+char_delta+transition+status+response+nav+loss+recovery)
     assert all(row.split()[1]=='0' for row in out),out
     assert out[6].split()[2]=='1' and out[7].split()[2]=='0' and out[8].split()[2]=='1', out
+    assert run([hello]+full+['FAILAFTER']+delta+['CHECKRESYNC'])[-1].split()[:2]==['1','1']
+    assert run([hello,'FAILPAINT']+full+['CHECKRESYNC'])[-1].split()[:2]==['0','1']
     broken=delta.copy();end=json.loads(broken[-1]);end['body']['checksum']^=1;broken[-1]=json.dumps(end,separators=(',',':'))
     assert run([hello]+full+broken)[-1].split()[1]=='1'
     # A checksum-valid batch containing an invalid primitive is still rejected.

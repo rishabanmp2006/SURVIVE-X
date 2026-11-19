@@ -1,5 +1,6 @@
 """Headless Linux application loop for the UNO Q Bridge prototype."""
 import argparse
+import journey
 import os
 import signal
 import subprocess
@@ -41,6 +42,7 @@ def main():
     parser.add_argument('--gnss-port',help='explicit GNSS NMEA serial device, if installed')
     parser.add_argument('--gnss-baud',type=int,default=9600)
     parser.add_argument('--check',action='store_true',help='validate configured files and llama-server options, then exit')
+    journey.add_options(parser)
     args=parser.parse_args()
     if args.check:
         try:
@@ -63,7 +65,7 @@ def main():
     sensors=LiveSensors()
     reader=NMEAReader(sensors,args.gnss_port,args.gnss_baud) if args.gnss_port else None
     ui=SURVIVEXApp(storage_path=args.waypoints,db_path=args.database,async_search=True,
-                    live_sensors=sensors,live_declination=args.declination)
+                    live_sensors=sensors,live_declination=args.declination,recorder=journey.configured(args))
     ui.sensor_mode=navigation.SensorMode.LIVE_GNSS
     link=BridgeLink()
     if reader: reader.start()

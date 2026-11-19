@@ -18,6 +18,7 @@ Architecture:
 - Safe offline operation: No LLM dependencies, no internet, no map downloads.
 """
 
+import journey
 import argparse
 import math
 import os
@@ -570,7 +571,10 @@ class SURVIVEXApp:
     Strictly enforces 320x240 screen boundary constraints.
     """
 
-    def __init__(self, storage_path: str = "waypoints.json", db_path: Optional[str] = None, async_search: bool = False, live_sensors=None, live_declination=None):
+    def __init__(self, storage_path: str = "waypoints.json", db_path: Optional[str] = None, async_search: bool = False, live_sensors=None, live_declination=None, recorder=None):
+        self.recorder = recorder
+        self.last_ai_message = None
+        self.ai_record_session = None
         self.current_screen = Screen.HOME
         self.running = True
         self.ai = ChatWorker()
@@ -695,7 +699,7 @@ class SURVIVEXApp:
     def navigation_state(self):
         gps = self.get_current_gps()
         compass = self.get_current_compass()
-        return nav.NavigationState.from_readings(gps, compass, self.live_declination if self.sensor_mode == nav.SensorMode.LIVE_GNSS else self.declination_deg)
+        return nav.NavigationState.from_readings(gps, compass, self.declination_deg if self.sensor_mode == nav.SensorMode.SIMULATED else self.live_declination)
 
     @property
     def start_position(self):
@@ -706,7 +710,7 @@ class SURVIVEXApp:
         if state.has_position and self.start_position is None:
             gps = state.gps
             self.session_starts[self.sensor_mode] = nav.Waypoint(
-                "Start Position", gps.lat, gps.lon, gps.altitude_m, source=self.sensor_mode.value
+                "Start Position", gps.lat, gps.lon, gps.altitude_m, created_at=time.time(), source=self.sensor_mode.value
             )
 
     def cycle_sensor_mode(self) -> None:
@@ -807,9 +811,15 @@ class SURVIVEXApp:
             return True
 
     def execute_places_name_search(self, state=None) -> None:
+        if self.recorder:
+            self.recorder.emit('search', 'user', query=self.places_query[:128],
+                               category=self.places_categories[self.places_selected_cat_idx])
         self.start_places_search(None, state)
 
     def execute_places_nearby_search(self, radius_km=50.0, state=None) -> None:
+        if self.recorder:
+            self.recorder.emit('search', 'user', radius_km=radius_km,
+                               category=self.places_categories[self.places_selected_cat_idx])
         self.start_places_search(radius_km, state)
 
     @staticmethod
@@ -883,6 +893,9 @@ class SURVIVEXApp:
 
     def close(self):
         self.ai.close()
+        if self.recorder:
+            self.record_state()
+            self.recorder.close()
         if self.search_executor:
             self.search_executor.shutdown(wait=True, cancel_futures=True)
         self.places_db.close()
@@ -928,7 +941,7 @@ class SURVIVEXApp:
             )
 
     def get_current_compass(self, current_time: Optional[float] = None) -> Optional[nav.CompassReading]:
-        if self.sensor_mode == nav.SensorMode.LIVE_GNSS:
+        if self.sensor_mode != nav.SensorMode.SIMULATED:
             return self.live_sensors.compass() if self.live_sensors is not None else None
         if not self.sim_compass_available:
             return None
@@ -942,6 +955,20 @@ class SURVIVEXApp:
     def set_notification(self, msg: str) -> None:
         self.notification_msg = msg
         self.notification_time = time.time()
+
+    def record_state(self):
+        recorder = self.recorder
+        if recorder.error or recorder.closed:
+            return
+        recorder.observe(self.navigation_state(), self.waypoint_mgr.get_active_waypoint())
+        if recorder.ai and self.ai_record_session == recorder.id:
+            messages = self.ai.messages
+            if messages and messages[-1] is not self.last_ai_message:
+                self.last_ai_message = messages[-1]
+                role, text = messages[-1]
+                if role == 'AI':
+                    recorder.emit('ai_response', 'AI unverified', text=text[:8192])
+                    self.ai_record_session = None
 
     def tick(self, current_time: Optional[float] = None) -> bool:
         """
@@ -961,10 +988,14 @@ class SURVIVEXApp:
             self.refresh_places_results(self.navigation_state())
             state_changed = state_changed or previous_generation != self.search_generation
 
+        if self.sensor_mode == nav.SensorMode.LIVE_GNSS and self.start_position is None:
+            self.capture_start()
         if self.sim_has_fix and not self.sim_stale_mode:
             # Active sensor stream simulation: Reading stays fresh as time advances
             self.sim_gps_timestamp = now
 
+        if self.recorder:
+            self.record_state()
         curr_sec = int(now)
         if curr_sec != self.last_clock_sec:
             self.last_clock_sec = curr_sec
@@ -975,7 +1006,15 @@ class SURVIVEXApp:
     def handle_action(self, action: Action, char: Optional[str] = None) -> None:
         """Processes discrete joystick/keyboard input."""
         try:
+            before = self.current_screen
+            if self.recorder and self.ai_record_session and before == Screen.ASSISTANT_INFO:
+                self.record_state()
             self._handle_action(action, char)
+            if self.recorder and self.current_screen != before:
+                self.recorder.emit('screen', 'user', action=action.name,
+                                   previous=before.name, screen=self.current_screen.name)
+            if self.recorder and action in (Action.SELECT, Action.TOGGLE_MODE):
+                self.record_state()
         except (ValueError, OSError) as exc:
             self.set_notification(str(exc))
             if self.current_screen == Screen.COORD_INPUT:
@@ -1067,6 +1106,8 @@ class SURVIVEXApp:
                 self.current_screen = Screen.HOME
             elif action == Action.SELECT:
                 if self.waypoints_idx == 0:
+                    if self.recorder:
+                        self.recorder.emit('request', 'user', command='Save current waypoint')
                     # Save current position
                     name = f"WP_{time.strftime('%H%M%S')}"
                     state = self.navigation_state()
@@ -1078,10 +1119,11 @@ class SURVIVEXApp:
                                                         "Saved via UI", source=self.sensor_mode.value)
                     self.set_notification(f"Saved {wp.display_name}")
                 elif self.waypoints_idx == 1:
-                    self.capture_start()
+                    if self.recorder:
+                        self.recorder.emit('request', 'user', command='Return to start')
                     start = self.start_position
                     if start is None or not self.navigation_state().has_position:
-                        self.set_notification("Return to start unavailable")
+                        self.set_notification("START UNAVAILABLE")
                         return
                     wp = self.waypoint_mgr.add_waypoint("Start Point", start.lat, start.lon,
                                                         start.altitude_m, "Starting Point",
@@ -1236,7 +1278,18 @@ class SURVIVEXApp:
                 self.coord_last_text_field = self.coord_active_field
 
         elif self.current_screen == Screen.STATUS:
-            if action == Action.SELECT:
+            if action == Action.LEFT and self.recorder:
+                self.recorder.stop()
+                self.set_notification("Recording disabled")
+            elif action == Action.RIGHT and self.recorder and self.recorder.closed:
+                prior = self.recorder
+                if prior.worker.is_alive():
+                    self.set_notification("Finishing previous journey")
+                else:
+                    self.last_ai_message = self.ai.messages[-1] if self.ai.messages else None
+                    self.recorder = journey.Recorder(prior.path, prior.interval, prior.ai, resumed=True)
+                    self.set_notification("New journey started")
+            elif action == Action.SELECT:
                 self.cycle_sensor_mode()
             elif action == Action.BACK:
                 self.current_screen = Screen.HOME
@@ -1258,9 +1311,16 @@ class SURVIVEXApp:
                 if self.ai_focus == 0:
                     self.current_screen = Screen.AI_KEYBOARD
                 elif self.ai_focus == 1:
+                    previous_messages = self.ai.messages
                     if self.ai_input.strip() == '/reset':
                         self.ai.clear(); self.ai_input = ''; self.ai_scroll = 0
                     elif self.ai.submit(self.ai_input):
+                        self.ai_record_session = None
+                        if (self.recorder and self.recorder.ai and not self.recorder.closed
+                                and not self.ai_input.strip().startswith('/forget ')):
+                            self.last_ai_message = previous_messages[-1] if previous_messages else None
+                            self.ai_record_session = self.recorder.id
+                            self.recorder.emit('ai_question', 'user / unverified AI chat', text=self.ai_input[:2048])
                         self.ai_input = ''; self.ai_scroll = 0
                 elif self.ai_focus == 2:
                     self.ai.cancel()
@@ -1500,7 +1560,16 @@ class SURVIVEXApp:
     def _render_footer(self, display: DisplayAdapter) -> None:
         display.draw_line(0, 219, 320, 219, Colors.DIVIDER, width=1)
         display.draw_rect(0, 220, 320, 20, Colors.FOOTER_BG)
-        display.draw_text(6, 224, f"STATUS: {self.notification_msg[:46]}", size="small", color=Colors.TEXT_MUTED)
+        prefix = 'STATUS'
+        message = self.notification_msg
+        if self.recorder:
+            prefix = 'REC' if self.recorder.ready else 'REC INIT'
+            if self.recorder.closed:
+                prefix = 'REC OFF'
+            if self.recorder.error:
+                prefix, message = 'REC ERROR', self.recorder.error
+        display.draw_text(6, 224, f"{prefix}: {message[:50-len(prefix)]}", size="small",
+                          color=Colors.RED if self.recorder and self.recorder.error else Colors.TEXT_MUTED)
 
     def _render_home(self, display: DisplayAdapter, state: nav.NavigationState) -> None:
         gps = state.gps
@@ -1597,8 +1666,8 @@ class SURVIVEXApp:
         display.draw_text(152, 71, format_distance(sol.distance_m), size="large", color=Colors.TEXT_WHITE)
         display.draw_text(152, 94, f"Bearing: {format_bearing(sol.bearing_deg)}", size="small", color=Colors.TEXT_WHITE)
         if sol.true_heading_deg is not None:
-            if self.sensor_mode == nav.SensorMode.LIVE_GNSS:
-                compass = self.get_current_compass()
+            if self.sensor_mode != nav.SensorMode.SIMULATED:
+                compass = state.compass
                 display.draw_text(152, 108, f"Heading: {sol.true_heading_deg:05.1f}° True", size="small", color=Colors.TEXT_WHITE)
                 display.draw_text(152, 121, f"Mag: {compass.magnetic_heading_deg:03.0f}° | Dec: {self.live_declination:+.1f}°", size="small", color=Colors.TEXT_MUTED)
             else:
@@ -1821,7 +1890,7 @@ class SURVIVEXApp:
 
         # Compass Diagnostic Box
         display.draw_rect(8, 134, 304, 40, Colors.PANEL, border_color=Colors.PANEL_BORDER, border_radius=4)
-        if state.true_heading is not None and self.sensor_mode == nav.SensorMode.LIVE_GNSS:
+        if state.true_heading is not None and self.sensor_mode != nav.SensorMode.SIMULATED:
             display.draw_text(14, 137, "MAGNETOMETER: LIVE", size="small", color=Colors.CYAN)
             display.draw_text(14, 149, f"Heading: {state.true_heading:.1f}° True", size="small", color=Colors.TEXT_WHITE)
             display.draw_text(14, 161, f"Declination: {self.live_declination:+.1f}°", size="small", color=Colors.TEXT_MUTED)
@@ -1839,12 +1908,15 @@ class SURVIVEXApp:
         if self.sensor_mode == nav.SensorMode.LIVE_GNSS and not state.has_position:
             display.draw_text(14, 182, f"ALERTS: LIVE GPS {gps_status.value}", size="small", color=Colors.AMBER)
         elif state.has_position and state.true_heading is not None:
-            label = "Position valid | LIVE heading available" if self.sensor_mode == nav.SensorMode.LIVE_GNSS else "Position valid | SIM heading available"
+            label = "Position valid | LIVE heading available" if self.sensor_mode != nav.SensorMode.SIMULATED else "Position valid | SIM heading available"
             display.draw_text(14, 182, label, size="small", color=Colors.GREEN)
         else:
             display.draw_text(14, 182, f"ALERTS: GPS={gps_status.value} | COMPASS={'ONLINE' if state.true_heading is not None else 'OFFLINE'}", size="small", color=Colors.AMBER)
 
-        display.draw_text(10, 202, "[M: Mode]  [G: Fix]  [T: Stale]  [C: Compass]  [Esc: Back]", size="small", color=Colors.TEXT_MUTED)
+        controls = "[M: Mode]  [G: Fix]  [T: Stale]  [C: Compass]  [Esc: Back]"
+        if self.recorder:
+            controls = "Recording: LEFT stop / RIGHT start | AI " + ("on" if self.recorder.ai else "off")
+        display.draw_text(10, 202, controls, size="small", color=Colors.TEXT_MUTED)
 
     def _render_assistant_info(self, display: DisplayAdapter) -> None:
         display.draw_text(8, 26, 'OFFLINE AI  ' + self.ai.status, size='med', color=Colors.CYAN)
@@ -2309,7 +2381,7 @@ def _run_app_tests(scratch: Path) -> bool:
 
         # Compute Geodesic Navigation Solution
         sol_bm = nav.compute_nav_solution(app.get_current_gps(), app.get_current_compass(), app.waypoint_mgr.get_active_waypoint(), declination_deg=0.0)
-        assert_test(sol_bm.status == nav.NavStatus.OK, "Bangalore -> Mysore navigation solution status is OK")
+        assert_test(sol_bm.status == nav.NavStatus.POSITION_UNCERTAIN and sol_bm.turn_angle_deg is None, "Manual position retains geodesics without unverified steering")
         # Expected distance: ~128.02 km (128,017 m)
         dist_bm_km = sol_bm.distance_m / 1000.0
         assert_test(abs(dist_bm_km - 128.02) < 0.2, f"Bangalore -> Mysore distance is ~128.02 km ({dist_bm_km:.2f} km)")
@@ -2570,7 +2642,7 @@ def run_app_demo(scale: int = 3, step_delay: float = 0.5) -> None:
 # 7. Main Interactive Application Loop
 # ==============================================================================
 
-def run_interactive(scale: int = 3, db_path=None) -> None:
+def run_interactive(scale: int = 3, db_path=None, recorder=None) -> None:
     """Runs live graphical Pygame simulator on macOS."""
     if pygame is None:
         print("\n[ERROR] Pygame is required for the macOS desktop simulator.")
@@ -2579,7 +2651,7 @@ def run_interactive(scale: int = 3, db_path=None) -> None:
         sys.exit(1)
 
     display = PygameDisplayAdapter(scale=scale)
-    app = SURVIVEXApp(db_path=db_path, async_search=True)
+    app = SURVIVEXApp(db_path=db_path, async_search=True, recorder=recorder)
     input_adapter = PygameInputAdapter(app_ref=app)
     clock = pygame.time.Clock()
 
@@ -2619,6 +2691,7 @@ def main():
     parser.add_argument("--scale", type=int, default=3, choices=[1, 2, 3, 4], help="Window scale factor (default: 3 = 960x720)")
     parser.add_argument("--delay", type=float, default=0.5, help="Step delay for demonstration (default: 0.5s)")
     parser.add_argument("--db", help="Offline SQLite places database")
+    journey.add_options(parser)
     args = parser.parse_args()
 
     if args.test:
@@ -2629,7 +2702,7 @@ def main():
         run_app_demo(scale=args.scale, step_delay=args.delay)
         sys.exit(0)
 
-    run_interactive(scale=args.scale, db_path=args.db)
+    run_interactive(scale=args.scale, db_path=args.db, recorder=journey.configured(args))
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ The **SURVIVE-X** project explores the feasibility of running a fully offline, s
 - **Reasonable Embedded Turnaround:** Given the modest throughput of quad ARM Cortex-A53 cores, inference parameters must be optimized to deliver responsive survival guidance without triggering out-of-memory (OOM) faults or excessive wait times.
 
 ### Key Evaluation Verdicts
-1. **Physical RAM Feasibility: PASSED.** Total active system RAM on the Arduino UNO Q is projected at **1,043.8 MB** (51.0% of the 2048 MB physical budget), preserving **1,004.2 MB (49.0%) of operating headroom** for filesystem page caching and burst memory.
+1. **Physical RAM feasibility: unverified projection.** Total active system RAM on the Arduino UNO Q is projected at **1,043.8 MB** (51.0% of the 2048 MB physical budget), preserving **1,004.2 MB (49.0%) of operating headroom** for filesystem page caching and burst memory.
 2. **Context & KV Cache Scaling: PASSED.** Due to Qwen3.5's hybrid linear/recurrent attention architecture, doubling the context window from 512 tokens to 1024 tokens costs only **6.0 MiB of KV cache** (25.0 MiB vs 31.0 MiB). Context size `1024` is optimal for maintaining 3 full exchanges of conversation history.
 3. **Mac Silicon vs Cortex-A53 Latency: DIVERGENT.** On Apple Silicon CPU, generation achieves **64–76 tokens/sec** (latency ~2.8–3.2s for 128 tokens). On the Arduino UNO Q's in-order Cortex-A53 cores, projected generation throughput is **4.5–5.5 tokens/sec**. A 128-token response will require ~25–30 seconds; capping triage responses to **48–64 tokens** is recommended to meet the 15-second response target.
 4. **Conversation Quality: 94.4% Pass Rate (17/18 Scenarios).** The model preserved critical clinical and procedural prohibitions (rejecting snakebite cutting, frostbite snow rubbing, and drinking boiled petroleum water) and successfully retained multi-turn injury context. However, hallucination risks remain in physical improvisations (e.g. confusing 9V batteries with car batteries and misidentifying flash floods as landslides).
@@ -197,9 +197,9 @@ pie title Arduino UNO Q 2GB System RAM Allocation (MB)
 
 | Context Size | KV Cache RAM | Total System RAM | Available Headroom | Headroom % | Memory Verdict |
 |:---:|:---:|:---:|:---:|:---:|:---:|
-| **512 tokens** | 25.0 MB | 1,037.8 MB | 1,010.2 MB | 49.3% | **PASSED (Optimal RAM)** |
-| **1024 tokens** | **31.0 MB** | **1,043.8 MB** | **1,004.2 MB** | **49.0%** | **PASSED (RECOMMENDED)** |
-| **2048 tokens** | 43.0 MB | 1,055.8 MB | 992.2 MB | 48.4% | **PASSED (Extended History)** |
+| **512 tokens** | 25.0 MB | 1,037.8 MB | 1,010.2 MB | 49.3% | **Unverified projection** |
+| **1024 tokens** | **31.0 MB** | **1,043.8 MB** | **1,004.2 MB** | **49.0%** | **Unverified projection** |
+| **2048 tokens** | 43.0 MB | 1,055.8 MB | 992.2 MB | 48.4% | **Unverified projection** |
 
 ---
 
@@ -220,7 +220,7 @@ The quad-core ARM Cortex-A53 CPU (ARMv8-A in-order dual-issue pipeline @ 1.2–1
 | **256 tokens** | Full In-Depth Procedure | ~6.0 s | ~51.2 s | **~57.2 seconds** | **NO (~57s)** |
 
 ### Embedded Deployment Recommendations
-1. **Dynamic Token Limiting:** Default to **48–64 tokens** for urgent emergency questions (e.g. snakebite, arterial bleeding, hypothermia) to guarantee response delivery within **12–16 seconds**.
+1. **Dynamic Token Limiting:** Default to **48–64 tokens** for urgent emergency questions (e.g. snakebite, arterial bleeding, hypothermia) as a latency target; actual UNO Q response time has not been measured.
 2. **System Prompt Caching:** Pre-cache the KV state of the invariant system prompt at boot time to eliminate 3.5 seconds of repeated prompt evaluation on every turn.
 3. **Memory Configuration:** Set `vm.swappiness=0` in Linux `/etc/sysctl.conf` to prevent the kernel from thrashing the onboard eMMC flash.
 4. **Direct Framebuffer GUI:** Run user interface directly via Linux DRM/KMS or `/dev/fb0` without X11 or Wayland display servers.
@@ -530,7 +530,7 @@ Following the diagnostic findings, [`chat.py`](file:///Users/kavya/SURVIVE-X-QWE
    You are an offline survival assistant. Give concise, direct, factual instructions without alarmism.
    ```
    This eliminates hyper-alarmist trigger words (`emergency`, `life-or-death`, `safety first`) that previously forced the model into panic-warning mode.
-5. **Context Budget Guard Against Silent Truncation:** Added `estimate_tokens()` and a proactive budgeting check (`max_allowed_prompt_tokens = args.ctx_size - args.max_tokens - 16`). If user input grows too large, the oldest user message is proactively pruned, guaranteeing that total prompt size never causes silent `llama.cpp` context clipping within the configured 1024-token budget.
+5. **Context Budget Guard Against Silent Truncation:** Added `estimate_tokens()` and a proactive budgeting check (`max_allowed_prompt_tokens = args.ctx_size - args.max_tokens - 16`). If user input grows too large, the oldest user message is proactively pruned, which is an estimate and cannot guarantee against `llama.cpp` context clipping within the configured 1024-token budget.
 6. **Pure LLM Generation Maintained:** The Qwen3.5-0.8B neural network remains the **sole answer generator**. No RAG, no retrieval databases, no hardcoded medical templates, and no output text substitutions were added.
 7. **No Token Suppression:** In strict compliance with guidelines, no tokens (`call`, `911`, `emergency services`) are masked or suppressed via logit biasing.
 8. **Full Recoverability & Compatibility:** Added `--history-mode` argument supporting `user_only` (new default), `original` (legacy alternating history for exact reproducibility), and `fresh` (zero-history single turn). Commands `/reset`, `/constraints`, `/stats`, and `/quit` function across all modes.
@@ -1215,3 +1215,18 @@ python3 places.py --test
 
 
 
+
+
+### Stage 7.1 safety notes
+
+UNO Q RAM and latency estimates above are projections, not hardware measurements or guarantees. The STM32 sketch remains a scaffold: its display receiver and input driver depend on the actual selected TFT and sensors.
+
+GGA acceptance requires advancing UTC, at least four satellites, HDOP in (0, 5], and quality 1, 2, 3, 4 or 5 (standard autonomous, differential, PPS, RTK fixed or RTK float). Other quality codes, including dead reckoning, manual and simulation, are rejected; receivers with nonstandard quality meanings require a validated driver and must not use this mapping unchanged. Receiver UTC alone cannot authenticate an advancing replay; configure a trusted receiver. A receiver clock that moves backward may require restarting the application. GGA HDOP is not a metre accuracy estimate, so a live GGA fix without a separately supplied accuracy does not authorize a steering arrow or arrival claim.
+
+The first validated live fix captured during a UI tick becomes the trip start, with source and time; Return to Start never captures or replaces it. In AI chat use `/forget exact constraint` to explicitly remove one recorded constraint; Clear resets all. Length-limited answers are labeled incomplete. The standalone CLI runs the model directly so its exit code is authoritative; `/usr/bin/time` memory metrics are unavailable in that path.
+
+The display receiver refuses ACK and requests a FULL frame after detectable parsing or drawing failure. The graphics API provides no pixel-completion feedback or atomic framebuffer, so physical SPI/pixel success cannot be guaranteed.
+
+### Stage 8 local journey recording
+
+The optional Human Black Box records validated navigation observations and user actions to a private SQLite file. Open an authorized export in the offline rescue dashboard to review the trajectory, outages and event timeline. [Recording, demonstration and recovery instructions](STAGE8.md).

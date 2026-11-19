@@ -1,5 +1,6 @@
 """Bounded host-side sensor ingestion; hardware-specific readers supply samples."""
 import math
+import re
 import threading
 import time
 
@@ -14,6 +15,7 @@ class LiveSensors:
         self._compass = None
         self._line = bytearray()
         self._overflow = False
+        self._receiver_time = None
 
     def disconnect_gnss(self):
         with self.lock:
@@ -62,7 +64,8 @@ class LiveSensors:
                         if self._parse_gga(bytes(self._line).rstrip(b'\r')):
                             accepted += 1
                     except (ValueError, UnicodeError, IndexError, OverflowError):
-                        pass
+                        if bytes(self._line).startswith((b'$GPGGA', b'$GNGGA', b'$GLGGA', b'$GAGGA')):
+                            self._gps = None
                 self._line.clear()
                 self._overflow = False
             elif not self._overflow:
@@ -77,7 +80,7 @@ class LiveSensors:
     def _coordinate(value, hemisphere, degrees):
         if hemisphere not in (('N','S') if degrees==2 else ('E','W')):
             raise ValueError('invalid hemisphere')
-        if len(value) < degrees+2:
+        if not re.fullmatch(r'[0-9]{%d}[0-9]{2}\.[0-9]{1,8}' % degrees, value):
             raise ValueError('invalid coordinate')
         degree = int(value[:degrees])
         minutes = float(value[degrees:])
@@ -92,7 +95,7 @@ class LiveSensors:
         if not text.startswith('$') or text.count('*') != 1:
             raise ValueError('invalid NMEA frame')
         content, checksum = text[1:].split('*')
-        if len(checksum) != 2:
+        if not re.fullmatch(r'[0-9A-Fa-f]{2}', checksum):
             raise ValueError('invalid checksum')
         value = 0
         for ch in content:
@@ -102,24 +105,41 @@ class LiveSensors:
         fields = content.split(',')
         if len(fields[0]) != 5 or fields[0][2:] != 'GGA':
             return False
+        if not re.fullmatch(r'[0-9]', fields[6]):
+            raise ValueError('invalid quality')
         quality = int(fields[6])
-        if quality < 0 or quality > 8:
-            raise ValueError('invalid fix quality')
-        if not quality:
-            with self.lock:
-                self._gps = None
-            return True
+        # Standard GGA satellite fixes; 6/7/8 are estimated/manual/simulation.
+        if quality not in (1, 2, 3, 4, 5):
+            self._gps = None
+            return False
+        stamp = fields[1]
+        if not re.fullmatch(r'[0-9]{6}(?:\.[0-9]{1,6})?', stamp):
+            raise ValueError('invalid receiver time')
+        hour, minute, second = int(stamp[:2]), int(stamp[2:4]), float(stamp[4:])
+        if hour > 23 or minute > 59 or not 0 <= second < 60:
+            raise ValueError('invalid receiver time')
+        receiver_time = hour*3600 + minute*60 + second
+        if self._receiver_time is not None:
+            progress = (receiver_time - self._receiver_time) % 86400
+            if progress == 0 or progress > 43200:
+                return False
         lat = self._coordinate(fields[2],fields[3],2)
         lon = self._coordinate(fields[4],fields[5],3)
-        satellites = int(fields[7]) if fields[7] else None
-        hdop = float(fields[8]) if fields[8] else None
+        if not re.fullmatch(r'[0-9]{1,2}', fields[7]) or not re.fullmatch(r'[0-9]+(?:\.[0-9]+)?', fields[8]):
+            raise ValueError('invalid satellite count or HDOP')
+        satellites = int(fields[7])
+        hdop = float(fields[8])
+        if satellites is None or satellites < 4 or hdop is None or not math.isfinite(hdop) or not 0 < hdop <= 5:
+            self._gps = None
+            return False
         altitude = float(fields[9]) if fields[9] and fields[10]=='M' else None
         if satellites is not None and not 0 <= satellites <= 99:
             raise ValueError('invalid satellite count')
         reading = nav.GPSReading(lat,lon,altitude,self.clock(),True,None,hdop,satellites,
-                                 nav.SensorMode.LIVE_GNSS)
+                                 nav.SensorMode.LIVE_GNSS, stamp, quality)
         with self.lock:
             self._gps = reading
+            self._receiver_time = receiver_time
         return True
 
 

@@ -21,6 +21,7 @@ class ChatWorker:
         self.status = 'READY'
         self.error = ''
         self.history = []
+        self.constraints = []
         self.messages = []
         self.process = None
         self.thread = None
@@ -37,6 +38,18 @@ class ChatWorker:
         if not prompt or len(prompt.encode('utf-8')) > 2048 or '<|' in prompt or '|>' in prompt:
             self.status, self.error = 'ERROR', 'Invalid or oversized input'
             return False
+        if prompt.startswith('/forget '):
+            target = prompt[8:].strip().casefold()
+            with self.lock:
+                matches = [c for c in self.constraints if c.casefold() == target]
+                if not matches:
+                    self.status, self.error = 'ERROR', 'Constraint not found; use exact wording'
+                    return False
+                self.constraints = [c for c in self.constraints if c.casefold() != target]
+                self.history = [h for h in self.history if target not in h.casefold()]
+                self.messages = (self.messages + [('You', prompt), ('AI', 'Constraint removed.')])[-12:]
+                self.status, self.error = 'READY', ''
+            return True
         self.cancelled.clear()
         self.error = ''
         self.status = 'LOADING'
@@ -57,6 +70,7 @@ class ChatWorker:
         self.cancel()
         with self.lock:
             self.history.clear()
+            self.constraints.clear()
             self.messages.clear()
             self.error = ''
         if not self.thread or not self.thread.is_alive():
@@ -103,8 +117,12 @@ class ChatWorker:
                     time.sleep(0.1)
             self.startup_seconds = time.monotonic() - self.started
             history = list(self.history)
-            if extract_explicit_constraints(prompt) or re.search(r'\b(actually|instead|correction|now have|no longer)\b', prompt, re.I):
-                history = []
+            constraints = list(self.constraints)
+            for constraint in extract_explicit_constraints(prompt):
+                if constraint not in constraints:
+                    constraints.append(constraint)
+            if len(constraints) > 32:
+                raise RuntimeError('Too many constraints; remove or clear some')
             def post(path, data, timeout=10):
                 request = urllib.request.Request(base + path, data=json.dumps(data).encode(),
                     headers={'Content-Type': 'application/json'})
@@ -115,7 +133,8 @@ class ChatWorker:
                 return json.loads(raw)
             while True:
                 context = '\n'.join('- ' + h for h in history)
-                user = ('Previous user context (may be superseded):\n' + context + '\n\n' if context else '') + 'Current request:\n' + prompt
+                confirmed = 'Confirmed constraints (remove with /forget exact wording):\n' + '\n'.join('- ' + c for c in constraints) + '\n\n' if constraints else ''
+                user = confirmed + ('Previous user context (may be superseded):\n' + context + '\n\n' if context else '') + 'Current request:\n' + prompt
                 messages = [{'role': 'system', 'content': DEFAULT_SYSTEM_PROMPT}, {'role': 'user', 'content': user}]
                 template = post('/apply-template', {'messages': messages, 'chat_template_kwargs': {'enable_thinking': False}})['prompt']
                 tokens = post('/tokenize', {'content': template, 'add_special': True, 'parse_special': True})['tokens']
@@ -135,17 +154,24 @@ class ChatWorker:
             if proc.poll() is not None and proc.returncode != 0:
                 raise RuntimeError(f'Model exited ({proc.returncode})')
             choice = result['choices'][0]
+            finish_reason = choice.get('finish_reason')
+            if finish_reason not in ('stop', 'length'):
+                raise RuntimeError('Missing or unsupported completion reason')
             text = choice['message']['content']
             if not isinstance(text, str) or not text.strip() or re.search(r'\x1b|<\|(?:im_|endoftext)|loading model|llama_model_loader:', text, re.I):
                 raise RuntimeError('Empty or malformed model response')
             text = ''.join(c for c in text if c in '\n\t' or ord(c) >= 32).strip()
             if not text:
                 raise RuntimeError('Empty model response')
+            if finish_reason == 'length':
+                marker = '\n[INCOMPLETE: token limit]'
+                text = text[:8192-len(marker)] + marker
             self.response_seconds = time.monotonic() - self.started
             with self.lock:
                 if self.cancelled.is_set():
                     return
                 self.history = (history + [prompt])[-3:]
+                self.constraints = constraints
                 self.messages = (self.messages + [('You', prompt), ('AI', text[:8192])])[-12:]
                 self.status = 'READY'
         except Exception as exc:

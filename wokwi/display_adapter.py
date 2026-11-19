@@ -21,7 +21,9 @@ def rgb565(color):
 
 def display_text(text):
     text = str(text).translate(str.maketrans({'•': '-', '°': 'o', '–': '-', '—': '-', '…': '...', '▶': '>', '◀': '<'}))
-    text = re.sub(r'\*\*|__|`', '', text)
+    text = re.sub(r'(?<!\w)\*\*(?=\S)(.+?)(?<=\S)\*\*(?!\w)', r'\1', text)
+    text = re.sub(r'(?<!\w)__(?=\S)(.+?)(?<=\S)__(?!\w)', r'\1', text)
+    text = re.sub(r'`([^`\n]+)`', r'\1', text)
     text = unicodedata.normalize('NFKD', text)
     return ''.join(c if 32 <= ord(c) <= 126 else '?' for c in text if not unicodedata.combining(c))
 

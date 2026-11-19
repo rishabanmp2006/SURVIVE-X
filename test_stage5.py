@@ -134,7 +134,7 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(execute({'choices': [{'message': {'content': ''}}]}).status, 'ERROR')
         self.assertEqual(execute({'choices': []}).status, 'ERROR')
         self.assertEqual(execute({'choices': [{'message': {'content': 'Loading model...'}}]}).status, 'ERROR')
-        result = execute({'choices': [{'message': {'content': 'OK'}}]})
+        result = execute({'choices': [{'finish_reason': 'stop', 'message': {'content': 'OK'}}]})
         self.assertEqual(result.status, 'READY', result.error)
 
 

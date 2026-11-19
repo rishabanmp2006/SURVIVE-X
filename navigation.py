@@ -28,7 +28,7 @@ import os
 import sys
 import tempfile
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Tuple
@@ -230,6 +230,8 @@ class GPSReading:
     hdop: Optional[float] = None
     satellites: Optional[int] = None
     sensor_mode: SensorMode = SensorMode.SIMULATED
+    receiver_utc: Optional[str] = None  # GGA UTC time of day, without a date
+    fix_quality: Optional[int] = None
 
     def validate(
         self,
@@ -529,15 +531,18 @@ class NavigationState:
     position_status: NavStatus
     position_message: str
     true_heading: Optional[float]
+    compass: Optional[CompassReading] = None
 
     @classmethod
     def from_readings(cls, gps, compass, declination, current_time=None):
         now = time.time() if current_time is None else current_time
+        gps = replace(gps)
+        compass = replace(compass) if compass is not None else None
         _, status, message = gps.validate(current_time=now)
         heading = None
         if compass and compass.validate(current_time=now)[0] and finite_number(declination):
             heading = magnetic_to_true_heading(compass.magnetic_heading_deg, declination)
-        return cls(gps, status, message, heading)
+        return cls(gps, status, message, heading, compass)
 
     @property
     def has_position(self):
@@ -562,7 +567,10 @@ class NavigationState:
         if accuracy is not None and distance + accuracy <= arrival_threshold_m:
             return NavSolution(NavStatus.ARRIVED, "Within arrival radius including reported accuracy.",
                                distance, bearing, None, None, "★", "AT_DESTINATION")
-        if bearing is None or (accuracy is not None and distance <= accuracy):
+        if accuracy is None:
+            return NavSolution(NavStatus.POSITION_UNCERTAIN, "Position accuracy unknown; steering unavailable.",
+                               distance, bearing, None, None, "—", "ACCURACY_UNKNOWN")
+        if bearing is None or distance <= accuracy:
             return NavSolution(NavStatus.POSITION_UNCERTAIN, "Target direction unresolved at this accuracy.",
                                distance, None, None, None, "—", "POSITION_UNCERTAIN")
         if self.true_heading is None:
@@ -823,7 +831,7 @@ def _run_tests(scratch: Path) -> bool:
 
     # 8. Missing Heading Handling
     print("\n[Test 8: Missing Compass Reading]")
-    gps_ok = GPSReading(45.0, -120.0, timestamp=t_fixed, has_fix=True)
+    gps_ok = GPSReading(45.0, -120.0, timestamp=t_fixed, has_fix=True, accuracy_m=3.0)
     sol_no_compass = compute_nav_solution(gps_ok, None, wp_test, current_time=t_fixed)
     assert_eq(sol_no_compass.status, NavStatus.MISSING_HEADING, "None compass reports MISSING_HEADING status")
     assert_eq(sol_no_compass.arrow, "—", "Missing compass reports '—' arrow without crash")

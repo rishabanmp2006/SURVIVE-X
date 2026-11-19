@@ -18,6 +18,7 @@ Memory Architecture:
 import argparse
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -121,6 +122,7 @@ def run_inference(
     temperature: float = 0.2,
     top_p: float = 0.9,
     repeat_penalty: float = 1.15,
+    timeout_sec: float = 120,
 ) -> dict:
     """
     Executes a single CPU-only inference pass using llama-cli.
@@ -128,7 +130,6 @@ def run_inference(
     and stderr for peak resident set size (RSS).
     """
     cmd = [
-        "/usr/bin/time", "-l",
         llama_cli,
         "-m", model_path,
         "-ngl", "0",
@@ -145,11 +146,27 @@ def run_inference(
     ]
 
     t0 = time.perf_counter()
-    res = subprocess.run(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            proc.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.communicate()
+        raise RuntimeError('Inference timed out')
+    if proc.returncode != 0:
+        raise RuntimeError(f'Inference failed (exit {proc.returncode})')
     latency_sec = time.perf_counter() - t0
-
-    stdout = res.stdout
-    stderr = res.stderr
 
     # Extract assistant generation cleanly, handling llama-cli prompt display truncation
     if " ... (truncated)\n" in stdout:
@@ -173,6 +190,9 @@ def run_inference(
         gen_text = gen_text.split("<|im_end|>")[0].strip()
     if "</think>" in gen_text:
         gen_text = gen_text.split("</think>")[-1].strip()
+
+    if not gen_text or re.search(r'\x1b|<\|(?:im_|endoftext)|loading model|llama_model_loader:', gen_text, re.I):
+        raise RuntimeError('Empty or malformed inference output')
 
     # Parse speed metrics
     prompt_speed_tps = 0.0
@@ -295,16 +315,18 @@ def main():
             continue
 
         # Extract any new verbatim constraints explicitly declared by user
+        candidate_constraints = list(confirmed_constraints)
+        candidate_history = list(user_history)
         new_constraints = extract_explicit_constraints(user_input)
         for c in new_constraints:
-            if c not in confirmed_constraints:
-                confirmed_constraints.append(c)
+            if c not in candidate_constraints:
+                candidate_constraints.append(c)
 
         # Build prompt
         prompt = format_qwen_prompt(
             system_prompt=args.sys_prompt,
-            user_history=user_history,
-            confirmed_constraints=confirmed_constraints,
+            user_history=candidate_history,
+            confirmed_constraints=candidate_constraints,
             user_input=user_input,
             mode=args.history_mode,
             legacy_history=legacy_history,
@@ -312,19 +334,20 @@ def main():
 
         # Context budget guard: prevent silent truncation by pruning oldest user turn if prompt grows too large
         max_allowed_prompt_tokens = args.ctx_size - args.max_tokens - 16
-        while user_history and estimate_tokens(prompt) > max_allowed_prompt_tokens:
-            user_history.pop(0)
+        while candidate_history and estimate_tokens(prompt) > max_allowed_prompt_tokens:
+            candidate_history.pop(0)
             prompt = format_qwen_prompt(
                 system_prompt=args.sys_prompt,
-                user_history=user_history,
-                confirmed_constraints=confirmed_constraints,
+                user_history=candidate_history,
+                confirmed_constraints=candidate_constraints,
                 user_input=user_input,
                 mode=args.history_mode,
                 legacy_history=legacy_history,
             )
 
         print("\nThinking...", end="", flush=True)
-        result = run_inference(
+        try:
+            result = run_inference(
             prompt=prompt,
             model_path=args.model,
             llama_cli=args.llama_cli,
@@ -332,7 +355,12 @@ def main():
             ctx_size=args.ctx_size,
             max_tokens=args.max_tokens,
         )
+        except (RuntimeError, OSError) as exc:
+            print(f"\rInference error: {exc}")
+            continue
         print("\r" + " " * 20 + "\r", end="", flush=True)
+        user_history = candidate_history
+        confirmed_constraints = candidate_constraints
 
         assistant_text = result["text"]
         last_stats = result
