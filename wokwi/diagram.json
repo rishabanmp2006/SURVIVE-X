@@ -1,0 +1,141 @@
+{
+  "version": 1,
+  "author": "SURVIVE-X",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board-arduino-nano-esp32",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": {},
+      "rotate": 0
+    },
+    {
+      "type": "wokwi-ili9341",
+      "id": "tft",
+      "top": -92,
+      "left": 300,
+      "attrs": {},
+      "rotate": 90
+    },
+    {
+      "type": "wokwi-analog-joystick",
+      "id": "stick",
+      "top": 220,
+      "left": -90,
+      "attrs": {},
+      "rotate": 0
+    },
+    {
+      "type": "wokwi-pushbutton",
+      "id": "back",
+      "top": 230,
+      "left": 120,
+      "attrs": {
+        "label": "Back",
+        "key": "B",
+        "color": "blue"
+      },
+      "rotate": 0
+    }
+  ],
+  "connections": [
+    [
+      "esp:3V3",
+      "tft:VCC",
+      "red",
+      []
+    ],
+    [
+      "esp:GND.1",
+      "tft:GND",
+      "black",
+      []
+    ],
+    [
+      "esp:D13",
+      "tft:SCK",
+      "green",
+      []
+    ],
+    [
+      "esp:D11",
+      "tft:MOSI",
+      "green",
+      []
+    ],
+    [
+      "esp:D12",
+      "tft:MISO",
+      "green",
+      []
+    ],
+    [
+      "esp:D10",
+      "tft:CS",
+      "green",
+      []
+    ],
+    [
+      "esp:D9",
+      "tft:D/C",
+      "green",
+      []
+    ],
+    [
+      "esp:3V3",
+      "stick:VCC",
+      "red",
+      []
+    ],
+    [
+      "esp:GND.2",
+      "stick:GND",
+      "black",
+      []
+    ],
+    [
+      "esp:A0",
+      "stick:HORZ",
+      "green",
+      []
+    ],
+    [
+      "esp:A1",
+      "stick:VERT",
+      "green",
+      []
+    ],
+    [
+      "esp:D4",
+      "stick:SEL",
+      "green",
+      []
+    ],
+    [
+      "esp:D2",
+      "back:1.l",
+      "green",
+      []
+    ],
+    [
+      "esp:GND.2",
+      "back:2.l",
+      "black",
+      []
+    ],
+    [
+      "esp:TX1",
+      "$serialMonitor:RX",
+      "green",
+      []
+    ],
+    [
+      "esp:RX0",
+      "$serialMonitor:TX",
+      "green",
+      []
+    ]
+  ]
+}
