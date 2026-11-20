@@ -211,19 +211,22 @@ def pack_ops(ops):
     """Group ordered primitives into bounded profile 3 draw payloads."""
     groups = []
     group = []
+    size = 5  # ["b"] plus a comma per item
     for op in ops:
-        trial = ['b', *group, op]
-        if len(compact(trial).encode()) > MAX_PAYLOAD:
-            if group:
-                groups.append(compact(['b', *group]) if len(group)>1 else compact(group[0]))
-            group = [op]
-        else:
-            group.append(op)
+        line = compact(op)
+        line_size = len(line.encode())
+        if line_size > MAX_PAYLOAD:
+            raise ValueError('payload exceeds receiver limits')
+        if group and size + 1 + line_size > MAX_PAYLOAD:
+            groups.append('["b",' + ','.join(group) + ']' if len(group) > 1 else group[0])
+            group = []
+            size = 5
+        group.append(line)
+        size += 1 + line_size
     if group:
-        groups.append(compact(['b', *group]) if len(group)>1 else compact(group[0]))
-    if any(len(line.encode()) > MAX_PAYLOAD for line in groups):
-        raise ValueError('payload exceeds receiver limits')
+        groups.append('["b",' + ','.join(group) + ']' if len(group) > 1 else group[0])
     return groups
+
 
 
 class IncrementalEncoder(ProtocolEncoder):

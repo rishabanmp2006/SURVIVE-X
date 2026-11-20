@@ -646,6 +646,8 @@ class SURVIVEXApp:
         self.places_db = plc.PlacesDatabase(selected_db, read_only=True)
         self.coverage_metadata = self.places_db.get_coverage_metadata()
         self.search_executor = ThreadPoolExecutor(max_workers=1) if async_search else None
+        self.worker_places_db = None
+        self.worker_places_identity = None
         self.search_future = None
         self.search_pending = None
         self.search_generation = 0
@@ -837,13 +839,21 @@ class SURVIVEXApp:
             outcome = coverage
         return results, coverage, outcome
 
-    @staticmethod
-    def search_in_worker(path, request):
-        db = plc.PlacesDatabase(path, read_only=True)
-        try:
-            return SURVIVEXApp.query_places(db, *request)
-        finally:
-            db.close()
+    def search_in_worker(self, path, request):
+        path = Path(path).resolve()
+        stat = path.stat()
+        identity = (path, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        if self.worker_places_identity != identity:
+            self.close_worker_places()
+            self.worker_places_db = plc.PlacesDatabase(path, read_only=True)
+            self.worker_places_identity = identity
+        return self.query_places(self.worker_places_db, *request)
+
+    def close_worker_places(self):
+        if self.worker_places_db is not None:
+            self.worker_places_db.close()
+            self.worker_places_db = None
+            self.worker_places_identity = None
 
     def start_places_search(self, radius, state=None):
         state = state or self.navigation_state()
@@ -897,6 +907,7 @@ class SURVIVEXApp:
             self.record_state()
             self.recorder.close()
         if self.search_executor:
+            self.search_executor.submit(self.close_worker_places).result()
             self.search_executor.shutdown(wait=True, cancel_futures=True)
         self.places_db.close()
 

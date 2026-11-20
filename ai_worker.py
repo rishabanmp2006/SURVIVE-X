@@ -2,6 +2,7 @@
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import threading
@@ -11,13 +12,20 @@ from pathlib import Path
 
 from chat import DEFAULT_MODEL_PATH, DEFAULT_SYSTEM_PROMPT, extract_explicit_constraints
 
-SERVER = os.environ.get('SURVIVEX_LLAMA_SERVER', '/opt/homebrew/bin/llama-server')
+SERVER = os.environ.get('SURVIVEX_LLAMA_SERVER') or shutil.which('llama-server') or '/opt/homebrew/bin/llama-server'
 MODEL = os.environ.get('SURVIVEX_MODEL', DEFAULT_MODEL_PATH)
 
 
 class ChatWorker:
-    def __init__(self, server=SERVER, model=MODEL):
-        self.server, self.model = server, model
+    def __init__(self, server=SERVER, model=MODEL, *, persistent=None, idle_timeout=None):
+        self.server, self.model = shutil.which(server) or server, model
+        self.persistent = (os.environ.get("SURVIVEX_AI_PERSISTENT", "1") != "0") if persistent is None else persistent
+        self.idle_timeout = float(os.environ.get("SURVIVEX_AI_IDLE_SECONDS", "180")) if idle_timeout is None else idle_timeout
+        if self.idle_timeout <= 0:
+            raise ValueError("Idle timeout must be positive")
+        self.base = None
+        self.idle_timer = None
+        self.closed = False
         self.status = 'READY'
         self.error = ''
         self.history = []
@@ -33,8 +41,12 @@ class ChatWorker:
 
     def submit(self, prompt):
         prompt = prompt.strip()
-        if self.thread and self.thread.is_alive():
+        if self.closed or (self.thread and self.thread.is_alive()):
             return False
+        with self.lock:
+            if self.idle_timer:
+                self.idle_timer.cancel()
+                self.idle_timer = None
         if not prompt or len(prompt.encode('utf-8')) > 2048 or '<|' in prompt or '|>' in prompt:
             self.status, self.error = 'ERROR', 'Invalid or oversized input'
             return False
@@ -76,45 +88,81 @@ class ChatWorker:
         if not self.thread or not self.thread.is_alive():
             self.status = 'READY'
 
+    @staticmethod
+    def _reap(proc):
+        if proc:
+            if proc.poll() is None:
+                proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2)
+
+    def _stop_server(self):
+        with self.lock:
+            proc = self.process
+            self.process = None
+            self.base = None
+            if self.idle_timer:
+                self.idle_timer.cancel()
+                self.idle_timer = None
+        self._reap(proc)
+
+    def _expire(self):
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return
+            proc = self.process
+            self.process = None
+            self.base = None
+            self.idle_timer = None
+        self._reap(proc)
+
     def close(self):
+        self.closed = True
         self.cancel()
         if self.thread:
             self.thread.join(timeout=3)
-        with self.lock:
-            if self.process and self.process.poll() is None:
-                self.process.kill()
+        self._stop_server()
 
     def _run(self, prompt):
         proc = None
         try:
             if not Path(self.model).is_file() or not os.access(self.server, os.X_OK):
                 raise RuntimeError('Model or llama-server missing')
-            with socket.socket() as sock:
-                sock.bind(('127.0.0.1', 0))
-                port = sock.getsockname()[1]
-            base = f'http://127.0.0.1:{port}'
             with self.lock:
-                if self.cancelled.is_set():
-                    return
-                proc = subprocess.Popen([self.server, '-m', self.model, '-ngl', '0', '-t', '4',
-                    '-c', '1024', '--parallel', '1', '--host', '127.0.0.1', '--port', str(port),
-                    '--reasoning', 'off'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL)
-                self.process = proc
-            deadline = time.monotonic() + 60
-            while True:
-                if self.cancelled.is_set():
-                    return
-                if proc.poll() is not None:
-                    raise RuntimeError(f'Model startup failed (exit {proc.returncode})')
-                if time.monotonic() > deadline:
-                    raise RuntimeError('Model startup timed out')
-                try:
-                    with urllib.request.urlopen(base + '/health', timeout=0.5) as response:
-                        if json.load(response).get('status') == 'ok':
-                            break
-                except (OSError, ValueError):
-                    time.sleep(0.1)
+                proc, base = self.process, self.base
+            if proc is not None and proc.poll() is not None:
+                self._stop_server()
+                proc = None
+            if proc is None:
+                with socket.socket() as sock:
+                    sock.bind(('127.0.0.1', 0))
+                    port = sock.getsockname()[1]
+                base = f'http://127.0.0.1:{port}'
+                with self.lock:
+                    if self.cancelled.is_set() or self.closed:
+                        return
+                    proc = subprocess.Popen([self.server, '-m', self.model, '-ngl', '0', '-t', '4',
+                        '-c', '1024', '--parallel', '1', '--host', '127.0.0.1', '--port', str(port),
+                        '--reasoning', 'off'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL)
+                    self.process, self.base = proc, base
+                deadline = time.monotonic() + 60
+                while True:
+                    if self.cancelled.is_set():
+                        return
+                    if proc.poll() is not None:
+                        raise RuntimeError(f'Model startup failed (exit {proc.returncode})')
+                    if time.monotonic() > deadline:
+                        raise RuntimeError('Model startup timed out')
+                    try:
+                        with urllib.request.urlopen(base + '/health', timeout=0.5) as response:
+                            if json.load(response).get('status') == 'ok':
+                                break
+                    except (OSError, ValueError):
+                        time.sleep(0.1)
             self.startup_seconds = time.monotonic() - self.started
             history = list(self.history)
             constraints = list(self.constraints)
@@ -179,13 +227,10 @@ class ChatWorker:
                 self.error = str(exc)[:160] or type(exc).__name__
                 self.status = 'ERROR'
         finally:
-            if proc:
-                if proc.poll() is None:
-                    proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
-            with self.lock:
-                self.process = None
+            if self.cancelled.is_set() or self.status == 'ERROR' or not self.persistent or self.closed:
+                self._stop_server()
+            elif proc:
+                with self.lock:
+                    self.idle_timer = threading.Timer(self.idle_timeout, self._expire)
+                    self.idle_timer.daemon = True
+                    self.idle_timer.start()

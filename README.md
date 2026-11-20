@@ -1230,3 +1230,21 @@ The display receiver refuses ACK and requests a FULL frame after detectable pars
 ### Stage 8 local journey recording
 
 The optional Human Black Box records validated navigation observations and user actions to a private SQLite file. Open an authorized export in the offline rescue dashboard to review the trajectory, outages and event timeline. [Recording, demonstration and recovery instructions](STAGE8.md).
+
+### Local development and tests
+
+Create the existing Python environment with Pygame installed, then run
+`.venv/bin/python app.py`. Set `SURVIVEX_MODEL` to the existing GGUF path and
+`SURVIVEX_LLAMA_SERVER` to a compatible `llama-server` executable, or put the
+executable on `PATH`. The chat worker loads the model on the first request and
+unloads it after 180 seconds idle. Set `SURVIVEX_AI_IDLE_SECONDS` to a positive
+number to change the timeout, or `SURVIVEX_AI_PERSISTENT=0` to stop the server
+after every request. Persistent mode keeps model memory allocated while idle;
+UNO Q memory sufficiency requires target measurement.
+
+Run `.venv/bin/python -m unittest discover` for Python regressions, and
+`node test_rescue.mjs` for the offline dashboard test. The Wokwi native checks
+are `.venv/bin/python wokwi/tests/check.py`, `check_chat.py`, `check_delta.py`
+and `check_bridge.py` under `wokwi/tests/`. Receiver compilation requires a C++
+compiler and ArduinoJson headers. Set `ARDUINOJSON_SRC` to their `src` directory
+if they are not installed in `~/Documents/Arduino/libraries/ArduinoJson/src`.

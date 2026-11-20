@@ -25,7 +25,7 @@ import tempfile
 import sqlite3
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -126,6 +126,9 @@ class PlacesDatabase:
 
     def __init__(self, db_path: str = DB_FILE_DEFAULT, read_only: bool = False):
         self.db_path = Path(db_path)
+        self.read_only = read_only
+        self._coverage_cache = None
+        self._coverage_version = None
         if read_only:
             self.conn = sqlite3.connect(self.db_path.resolve().as_uri() + "?mode=ro", uri=True)
         else:
@@ -232,6 +235,10 @@ class PlacesDatabase:
         self.conn.commit()
 
     def get_coverages(self) -> List[CoverageMeta]:
+        version = (self.conn.execute("PRAGMA data_version").fetchone()[0],
+                   self.conn.execute("PRAGMA schema_version").fetchone()[0])
+        if self.read_only and self._coverage_cache is not None and version == self._coverage_version:
+            return [replace(item) for item in self._coverage_cache]
         rows = self.conn.execute("SELECT * FROM coverage_meta ORDER BY region_name")
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(places)")}
         coverages = []
@@ -241,7 +248,9 @@ class PlacesDatabase:
             else:
                 count = self.conn.execute("SELECT COUNT(*) FROM places").fetchone()[0]
             coverages.append(CoverageMeta(**dict(row), place_count=count))
-        return coverages
+        if self.read_only:
+            self._coverage_cache, self._coverage_version = coverages, version
+        return [replace(item) for item in coverages]
 
     def get_coverage(self) -> Optional[CoverageMeta]:
         coverages = self.get_coverages()
