@@ -35,6 +35,48 @@ def digest(previous, record):
 
 
 @contextlib.contextmanager
+def recovery_copy(path):
+    """Recover an offline, stable evidence set in a disposable directory."""
+    path = Path(path).resolve()
+    suffixes = ('', '-journal', '-wal', '-shm')
+    lock_path = Path(str(path) + '.lock')
+    guard = lock_path.open('rb') if lock_path.exists() else contextlib.nullcontext()
+    with guard as lock:
+        if lock:
+            fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        with tempfile.TemporaryDirectory(prefix='survivex-recovery-') as tmp:
+            target = Path(tmp) / 'evidence.sqlite'
+            hashes = {}
+            def snapshot():
+                result = {}
+                for suffix in suffixes:
+                    source = Path(str(path) + suffix)
+                    if source.exists():
+                        with source.open('rb') as stream:
+                            result[suffix] = hashlib.file_digest(stream, 'sha256').hexdigest()
+                return result
+            before = snapshot()
+            if '' not in before:
+                raise ValueError('Evidence database missing')
+            for suffix in before:
+                source = Path(str(path) + suffix)
+                dest = Path(str(target) + suffix)
+                shutil.copyfile(source, dest)
+                with dest.open('rb') as stream:
+                    hashes[suffix] = hashlib.file_digest(stream, 'sha256').hexdigest()
+            if hashes != before or snapshot() != before:
+                raise ValueError('Evidence changed during copy; acquire an offline snapshot')
+            print('Evidence SHA-256: ' + ', '.join((path.name + suffix + '=' + h) for suffix, h in before.items()), file=sys.stderr)
+            try:
+                with contextlib.closing(sqlite3.connect(target)) as recovered:
+                    if recovered.execute('pragma quick_check').fetchone()[0] != 'ok':
+                        raise ValueError('Recovered database integrity check failed')
+                yield target
+            except sqlite3.Error as exc:
+                raise ValueError('Working-copy recovery failed: ' + str(exc)) from exc
+
+
+@contextlib.contextmanager
 def database(path, origin=None, delete=False):
     """An exclusive writer lock also keeps deletion away from live sessions."""
     path = Path(path).resolve()
@@ -81,6 +123,8 @@ class Recorder:
         self.origin, self.clock = origin, clock
         self.id = session or uuid.uuid4().hex
         self.error = ''
+        self.degraded = ''
+        self.losses = {}
         self.ready = False
         self.closed = False
         self.pending = queue.Queue(256)
@@ -94,14 +138,27 @@ class Recorder:
         self.worker.start()
 
     def emit(self, kind, actor, **data):
-        if self.closed or self.error:
-            return
         if kind in ('ai_question', 'ai_response') and not self.ai:
-            return
-        try:
-            self.pending.put_nowait((self.clock(), kind, actor, data))
-        except queue.Full:
-            self.error = 'Recorder queue full'
+            return False
+        item = (self.clock(), kind, actor, data)
+        with self.pending.mutex:
+            if self.closed or self.error:
+                self.losses[kind] = self.losses.get(kind, 0) + 1
+                return False
+            if len(self.pending.queue) >= self.pending.maxsize:
+                routine = next((v for v in self.pending.queue if v[1] in ('position', 'checkpoint')), None)
+                if kind not in ('position', 'checkpoint') and routine is not None:
+                    self.pending.queue.remove(routine)
+                    lost = routine[1]
+                else:
+                    lost = kind
+                self.losses[lost] = self.losses.get(lost, 0) + 1
+                self.degraded = 'Events dropped: ' + str(sum(self.losses.values()))
+                if lost == kind and (routine is None or kind in ('position', 'checkpoint')):
+                    return False
+            self.pending.queue.append(item)
+            self.pending.not_empty.notify()
+        return True
 
     def observe(self, state, destination, mono=None):
         mono = time.monotonic() if mono is None else mono
@@ -140,16 +197,21 @@ class Recorder:
                 with db:
                     db.execute('insert into journeys values(?,0,?)', (self.id, ZERO))
                 self.ready = True
-                while not self.finished.is_set() or not self.pending.empty():
+                reported = {}
+                while not self.finished.is_set() or not self.pending.empty() or reported != self.losses:
                     try:
                         batch = [self.pending.get(timeout=.15)]
                     except queue.Empty:
-                        continue
+                        batch = []
                     while len(batch) < 64 and not self.pending.empty():
                         batch.append(self.pending.get_nowait())
                     if shutil.disk_usage(self.path.parent).free < RESERVE:
                         self.error = 'Low disk space'
                         batch = []  # Use the reserve only for the terminal error marker.
+                    with self.pending.mutex:
+                        current_losses = dict(self.losses)
+                    if current_losses != reported:
+                        batch.append((self.clock(), 'logging_error', 'device', {'reason': 'Events dropped', 'counts': current_losses}))
                     if self.error:
                         batch.append((self.clock(), 'logging_error', 'device', {'reason': self.error}))
                     with db:
@@ -163,6 +225,7 @@ class Recorder:
                             previous = digest(previous, record)
                             db.execute('insert into events values(?,?,?,?)', (self.id, seq, record, previous))
                         db.execute('update journeys set n=?,head=? where id=?', (seq, previous, self.id))
+                    reported = current_losses
                     if self.error:
                         break
         except (OSError, ValueError, sqlite3.Error) as exc:
@@ -180,11 +243,17 @@ class Recorder:
     def close(self):
         self.emit('shutdown', 'device', scope='application')
         self.stop()
-        self.worker.join()
+        self.worker.join(timeout=2)
+        if self.worker.is_alive():
+            with self.pending.mutex:
+                for _, kind, _, _ in self.pending.queue:
+                    self.losses[kind] = self.losses.get(kind, 0) + 1
+                self.pending.queue.clear()
+            self.error = 'Shutdown timed out; uncommitted events: ' + str(self.losses)
 
 
 def export(path, session, output):
-    with database(path) as db:
+    with recovery_copy(path) as recovered, database(recovered) as db:
         db.execute('begin')
         meta = db.execute('select n,head from journeys where id=?', (session,)).fetchone()
         if not meta:
@@ -252,7 +321,7 @@ def main():
     elif args.command == 'export':
         export(args.path, args.session, args.output)
     elif args.command == 'list':
-        with database(args.path) as db:
+        with recovery_copy(args.path) as recovered, database(recovered) as db:
             for sid, count in db.execute('select id,n from journeys order by rowid'):
                 print(sid, count)
     else:

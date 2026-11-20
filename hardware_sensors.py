@@ -8,8 +8,12 @@ import navigation as nav
 
 
 class LiveSensors:
-    def __init__(self, clock=time.time):
+    def __init__(self, clock=time.time, monotonic=time.monotonic):
         self.clock = clock
+        self.monotonic = monotonic
+        self._receiver_monotonic = None
+        self.gnss_state = "disconnected"
+        self._reacquiring = False
         self.lock = threading.RLock()
         self._gps = None
         self._compass = None
@@ -20,6 +24,10 @@ class LiveSensors:
     def disconnect_gnss(self):
         with self.lock:
             self._gps = None
+            self._receiver_time = None
+            self._receiver_monotonic = None
+            self._reacquiring = True
+            self.gnss_state = "disconnected"
             self._line.clear()
             self._overflow = False
 
@@ -119,10 +127,6 @@ class LiveSensors:
         if hour > 23 or minute > 59 or not 0 <= second < 60:
             raise ValueError('invalid receiver time')
         receiver_time = hour*3600 + minute*60 + second
-        if self._receiver_time is not None:
-            progress = (receiver_time - self._receiver_time) % 86400
-            if progress == 0 or progress > 43200:
-                return False
         lat = self._coordinate(fields[2],fields[3],2)
         lon = self._coordinate(fields[4],fields[5],3)
         if not re.fullmatch(r'[0-9]{1,2}', fields[7]) or not re.fullmatch(r'[0-9]+(?:\.[0-9]+)?', fields[8]):
@@ -135,11 +139,29 @@ class LiveSensors:
         altitude = float(fields[9]) if fields[9] and fields[10]=='M' else None
         if satellites is not None and not 0 <= satellites <= 99:
             raise ValueError('invalid satellite count')
+        now_mono = self.monotonic()
+        if self._receiver_monotonic is not None and now_mono - self._receiver_monotonic > 43200:
+            self._receiver_time = None
+            self._reacquiring = True
+            self._gps = None
+        if self._receiver_time is not None:
+            progress = (receiver_time - self._receiver_time) % 86400
+            if progress == 0 or progress > 43200:
+                return False
+        if self._reacquiring:
+            self._receiver_time = receiver_time
+            self._receiver_monotonic = now_mono
+            self._reacquiring = False
+            self.gnss_state = "reacquiring"
+            self._gps = None
+            return False
         reading = nav.GPSReading(lat,lon,altitude,self.clock(),True,None,hdop,satellites,
                                  nav.SensorMode.LIVE_GNSS, stamp, quality)
         with self.lock:
             self._gps = reading
             self._receiver_time = receiver_time
+            self._receiver_monotonic = now_mono
+            self.gnss_state = "valid"
         return True
 
 

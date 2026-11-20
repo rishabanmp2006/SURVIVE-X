@@ -1566,6 +1566,8 @@ class SURVIVEXApp:
             prefix = 'REC' if self.recorder.ready else 'REC INIT'
             if self.recorder.closed:
                 prefix = 'REC OFF'
+            if self.recorder.degraded:
+                prefix, message = 'REC WARNING', self.recorder.degraded
             if self.recorder.error:
                 prefix, message = 'REC ERROR', self.recorder.error
         display.draw_text(6, 224, f"{prefix}: {message[:50-len(prefix)]}", size="small",

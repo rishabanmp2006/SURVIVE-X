@@ -58,3 +58,11 @@ node test_rescue.mjs
 ```
 
 The browser regression uses installed Chrome, a temporary profile, a local debugging pipe and offline network emulation. Set `CHROME_BIN` for another installation. Node and Chrome are test tools only. The dashboard runs directly from its HTML file.
+
+## Stage 9.1 recovery and recording limits
+
+List and export copy the database and any present rollback journal, WAL and shared-memory sidecars to an isolated temporary directory. They print SHA-256 hashes of the acquired evidence files to standard error, check the copied set for changes during acquisition, and let SQLite recover the copy. Preserve those hashes with the evidence. Acquire from a stopped device or a consistent filesystem snapshot. The sidecar lock coordinates this application's recorder but cannot exclude unrelated SQLite writers. A missing sidecar cannot always be detected or reconstructed, and a valid hash chain cannot establish that an evidence set is complete.
+
+After a genuine GNSS disconnect or more than twelve hours without an accepted receiver timestamp, two valid advancing receiver times are required before reacquisition. Midnight rollover is accepted. GGA time of day does not authenticate a receiver or distinguish all replay, clock reset and multiday-outage cases.
+
+When the recording queue is full, routine position checkpoints are shed before important events where possible. Counts by event category are recorded in a logging-error event when storage permits, and the footer shows a recording warning. The writer drains for at most two seconds during shutdown. A permanently stalled write may leave an in-flight transaction with unknown outcome after shutdown returns. Storage exhaustion or an unavailable writer can prevent a loss report from being committed. Physical eMMC power-loss behavior remains unverified.
